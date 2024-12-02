@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from mamba_vision import MambaVision, mamba_vision_T, mamba_vision_S, mamba_vision_B, mamba_vision_L, mamba_vision_L2
-
+from .registry import register_pip_model  # Relative import
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -263,23 +263,7 @@ class CLIP(nn.Module):
         self.context_length = context_length
 
          # Initialize Image Encoder based on the selected type
-        if image_encoder_type == 'MambaVision':
-            # Choose specific MambaVision variant
-            # You can pass additional kwargs if needed
-            self.visual = mamba_vision_T(pretrained=True)
-            
-            # Determine MambaVision's output dimension
-            with torch.no_grad():
-                dummy_input = torch.zeros(1, 3, image_resolution, image_resolution)
-                mamba_output = self.visual.forward_features(dummy_input)
-                mambavision_output_dim = mamba_output.shape[1]
-            
-            # Projection layer to align with CLIP's embed_dim
-            self.image_projection = nn.Linear(mambavision_output_dim, embed_dim)
-            nn.init.normal_(self.image_projection.weight, std=0.02)
-            nn.init.zeros_(self.image_projection.bias)
-        
-        elif image_encoder_type == 'Original':
+        if image_encoder_type == 'Original':
             # Initialize the original CLIP image encoder (e.g., ResNet or VisionTransformer)
             # Here, assuming it's a ResNet-based encoder; adjust as per your original CLIP implementation
             self.visual = ModifiedResNet(
@@ -289,7 +273,26 @@ class CLIP(nn.Module):
                 input_resolution=image_resolution,
                 patch_size=vision_patch_size
             )
-        
+        elif image_encoder_type.startswith('MambaVision'):
+            # Initialize MambaVision image encoder
+            # Import MambaVision models inside the class to avoid circular imports
+            if image_encoder_type == 'MambaVision_T':
+                from .mamba_vision import mamba_vision_T
+                self.visual = mamba_vision_T(pretrained=True)
+            elif image_encoder_type == 'MambaVision_S':
+                from .mamba_vision import mamba_vision_S
+                self.visual = mamba_vision_S(pretrained=True)
+            elif image_encoder_type == 'MambaVision_B':
+                from .mamba_vision import mamba_vision_B
+                self.visual = mamba_vision_B(pretrained=True)
+            elif image_encoder_type == 'MambaVision_L':
+                from .mamba_vision import mamba_vision_L
+                self.visual = mamba_vision_L(pretrained=True)
+            elif image_encoder_type == 'MambaVision_L2':
+                from .mamba_vision import mamba_vision_L2
+                self.visual = mamba_vision_L2(pretrained=True)
+            else:
+                raise ValueError(f"Unsupported MambaVision variant: {image_encoder_type}")
         else:
             raise ValueError(f"Unsupported image_encoder_type: {image_encoder_type}")
 
@@ -334,45 +337,33 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
+    def forward(self, image, text):
+        # Define the forward pass
+        # Encode image
         if hasattr(self, 'image_projection'):
-            # Using MambaVision
-            features = self.visual.forward_features(image)  # (B, C)
-            projected = self.image_projection(features)     # (B, embed_dim)
+            features = self.visual.forward_features(image)
+            image_features = self.image_projection(features)
         else:
-            # Using Original Image Encoder
-            projected = self.visual(image)                  # (B, embed_dim)
-        return projected
-
-    def encode_text(self, text):
-        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
-
-        x = x + self.positional_embedding.type(self.dtype)
+            image_features = self.visual(image)
+        
+        # Encode text
+        x = self.token_embedding(text)
+        x = x + self.positional_embedding
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
-
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        x = self.ln_final(x)
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-
-        return x
-
-    def forward(self, image, text):
-        image_features = self.encode_image(image)
-        text_features = self.encode_text(text)
-
-        # normalized features
+        
+        # Normalize features
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=1, keepdim=True)
-
-        # cosine similarity as logits
+        text_features = x / x.norm(dim=1, keepdim=True)
+        
+        # Compute cosine similarity
         logit_scale = self.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()
         logits_per_text = logits_per_image.t()
-
-        # shape = [global_batch_size, global_batch_size]
+        
         return logits_per_image, logits_per_text
 
 
@@ -439,4 +430,45 @@ def build_model(state_dict: dict):
     model.load_state_dict(state_dict)
     return model.eval()
 
+# Define clip_with_encoder
+def clip_with_encoder(image_encoder_type='Original', **kwargs):
+    embed_dim = 512  # Adjust based on your requirements
+    model = CLIP(
+        embed_dim=embed_dim,
+        image_encoder_type=image_encoder_type,
+        **kwargs
+    )
+    return model
 
+# Register models with the registry
+def register_models():
+    # Define a factory function for CLIP with Original Image Encoder
+    def create_clip_original(pretrained=False, **kwargs):
+        return clip_with_encoder(image_encoder_type='Original', **kwargs)
+    
+    # Define factory functions for CLIP with MambaVision Image Encoder variants
+    def create_clip_mamba_T(pretrained=False, **kwargs):
+        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
+    
+    def create_clip_mamba_S(pretrained=False, **kwargs):
+        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
+    
+    def create_clip_mamba_B(pretrained=False, **kwargs):
+        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
+    
+    def create_clip_mamba_L(pretrained=False, **kwargs):
+        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
+    
+    def create_clip_mamba_L2(pretrained=False, **kwargs):
+        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
+    
+    # Register the models
+    register_pip_model('CLIP_Original', create_clip_original)
+    register_pip_model('CLIP_MambaVision_T', create_clip_mamba_T)
+    register_pip_model('CLIP_MambaVision_S', create_clip_mamba_S)
+    register_pip_model('CLIP_MambaVision_B', create_clip_mamba_B)
+    register_pip_model('CLIP_MambaVision_L', create_clip_mamba_L)
+    register_pip_model('CLIP_MambaVision_L2', create_clip_mamba_L2)
+
+# Call the registration function
+register_models()
