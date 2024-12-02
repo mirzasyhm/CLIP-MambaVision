@@ -25,7 +25,7 @@ from timm.models.registry import register_model
 import torch.nn.functional as F
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from einops import rearrange, repeat
-from .registry import register_pip_model
+from registry import register_pip_model
 from pathlib import Path
 
 
