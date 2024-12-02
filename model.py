@@ -405,13 +405,16 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict, vision_type: str):
+# In model.py
+
+def build_model(state_dict: dict, vision_type: str, mamba_params: dict ):
     """
-    Builds the CLIP model based on the state_dict and vision_type.
+    Builds the CLIP model based on the state_dict, vision_type, and mamba_params.
 
     Parameters:
         state_dict (dict): The state dictionary of the model.
         vision_type (str): The type of vision encoder ('resnet', 'vit', 'mambavision').
+        mamba_params (dict): Parameters specific to MambaVision.
 
     Returns:
         model (CLIP): The instantiated CLIP model.
@@ -427,8 +430,6 @@ def build_model(state_dict: dict, vision_type: str):
     # Initialize vision encoder based on vision_type
     if vision_type == 'resnet':
         # Extract ResNet-specific parameters
-        # Assuming state_dict keys follow CLIP's ModifiedResNet naming
-        # Extract vision_width, vision_layers, etc.
         vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
         vision_layers = tuple(
             len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}")))
@@ -464,32 +465,14 @@ def build_model(state_dict: dict, vision_type: str):
         else:
             raise ValueError("State dict does not contain 'visual.proj' key for ViT.")
     elif vision_type == 'mambavision':
-        # Extract MambaVision-specific parameters
-        # The exact extraction depends on how MambaVision parameters are stored in state_dict
-        # Assuming they are prefixed with 'visual.' similar to other encoders
-
-        # Example extraction:
-        mamba_params = {
-            'dim': state_dict.get('visual.dim', 128),
-            'in_dim': state_dict.get('visual.in_dim', 64),
-            'depths': state_dict.get('visual.depths', [3, 3, 10, 5]),
-            'num_heads': state_dict.get('visual.num_heads', [2, 4, 8, 16]),
-            'window_size': state_dict.get('visual.window_size', [8, 8, 14, 7]),
-            'mlp_ratio': state_dict.get('visual.mlp_ratio', 4),
-            'drop_path_rate': state_dict.get('visual.drop_path_rate', 0.2),
-            'in_chans': state_dict.get('visual.in_chans', 3),
-            'num_classes': state_dict.get('visual.num_classes', 1000),
-            'qkv_bias': state_dict.get('visual.qkv_bias', True),
-            'qk_scale': state_dict.get('visual.qk_scale', None),
-            'drop_rate': state_dict.get('visual.drop_rate', 0.0),
-            'attn_drop_rate': state_dict.get('visual.attn_drop_rate', 0.0),
-            'layer_scale': state_dict.get('visual.layer_scale', None),
-            'layer_scale_conv': state_dict.get('visual.layer_scale_conv', None),
-        }
-
+        # Ensure mamba_params is provided
+        if mamba_params is None:
+            raise ValueError("mamba_params must be provided for 'mambavision' vision_type.")
+        
+        # Initialize MambaVision with provided parameters
         visual_encoder = MambaVision(**mamba_params)
     else:
-        raise ValueError(f"Unsupported vision_type '{vision_type}'.")
+        raise ValueError(f"Unsupported vision_type '{vision_type}'. Choose from 'resnet', 'vit', 'mambavision'.")
 
     # Instantiate CLIP model with the selected visual encoder
     model = CLIP(
