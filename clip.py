@@ -10,9 +10,9 @@ from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from tqdm import tqdm
 
-from .model import build_model
-from .simple_tokenizer import SimpleTokenizer as _Tokenizer
-from .registry import list_models, is_model, model_entrypoint, load_checkpoint
+from model import build_model
+from simple_tokenizer import SimpleTokenizer as _Tokenizer
+from registry import list_models, is_model, model_entrypoint, load_checkpoint
 
 
 try:
