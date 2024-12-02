@@ -146,6 +146,7 @@ def _download(model_info: dict, root: str):
 
     return download_target
 
+
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
 
@@ -161,13 +162,14 @@ def _transform(n_px):
 
 
 def available_models() -> List[str]:
-    """Returns the names of available CLIP models"""
+    """Returns the names of available CLIP and MambaVision models"""
     return list(_MODELS.keys())
 
 
 def load(name: str, 
          vision_type: str = 'resnet', 
          mamba_params: dict = None,
+         clip_model_name: str = "RN50",  # Default CLIP model
          device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", 
          jit: bool = False, 
          download_root: str = None):
@@ -185,6 +187,9 @@ def load(name: str,
     mamba_params : dict
         Parameters specific to MambaVision if `vision_type` is 'mambavision'.
 
+    clip_model_name : str
+        The name of the CLIP model to use (e.g., "RN50", "ViT-B/32"). Must be present in _MODELS.
+
     device : Union[str, torch.device]
         The device to put the loaded model.
 
@@ -197,129 +202,78 @@ def load(name: str,
     Returns
     -------
     model : torch.nn.Module
-        The CLIP model.
+        The CLIP model with the specified vision encoder.
 
     preprocess : Callable[[PIL.Image], torch.Tensor]
         A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input.
     """
-    if name in _MODELS:
-        model_info = _MODELS[name]
-        model_path = _download(model_info, download_root or os.path.expanduser("~/.cache/clip"))
-    elif os.path.isfile(name):
-        model_path = name
-    else:
-        raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
+    # Load CLIP's state_dict
+    if clip_model_name not in _MODELS:
+        raise ValueError(f"CLIP model '{clip_model_name}' is not available. Choose from: {available_models()}")
 
+    clip_model_info = _MODELS[clip_model_name]
+    clip_model_path = _download(clip_model_info, download_root or os.path.expanduser("~/.cache/clip"))
+
+    print(f"Loading CLIP model '{clip_model_name}'...")
+    clip_model = torch.jit.load(clip_model_path, map_location="cpu") if jit else torch.load(clip_model_path, map_location="cpu")
     if jit:
-        # Attempt to load as JIT model
-        try:
-            model = torch.jit.load(model_path, map_location=device).eval()
-            return model, _transform(model.visual.input_resolution)
-        except RuntimeError as e:
-            raise RuntimeError(f"Failed to load JIT model: {e}")
-
-    # Load as state_dict
-    try:
-        state_dict = torch.load(model_path, map_location="cpu")
-    except Exception as e:
-        raise RuntimeError(f"Failed to load state_dict: {e}")
-
-    # Determine vision_type based on model name if not explicitly provided
-    inferred_vision_type = vision_type
-    if 'mambavision' in name.lower():
-        inferred_vision_type = 'mambavision'
-    elif 'vit' in name.lower():
-        inferred_vision_type = 'vit'
+        clip_state_dict = clip_model.state_dict()
     else:
-        inferred_vision_type = 'resnet'
+        if 'state_dict' in clip_model:
+            clip_state_dict = clip_model['state_dict']
+        else:
+            clip_state_dict = clip_model
 
-    # If vision_type is 'mambavision' and mamba_params not provided, extract from state_dict
-    if inferred_vision_type == 'mambavision' and mamba_params is None:
-        # Extract MambaVision parameters from state_dict or define defaults
-        # Adjust the keys based on your state_dict structure
-        mamba_params = {
-            'dim': state_dict.get('visual.dim', 128),
-            'in_dim': state_dict.get('visual.in_dim', 64),
-            'depths': state_dict.get('visual.depths', [3, 3, 10, 5]),
-            'num_heads': state_dict.get('visual.num_heads', [2, 4, 8, 16]),
-            'window_size': state_dict.get('visual.window_size', [8, 8, 14, 7]),
-            'mlp_ratio': state_dict.get('visual.mlp_ratio', 4),
-            'drop_path_rate': state_dict.get('visual.drop_path_rate', 0.2),
-            'in_chans': state_dict.get('visual.in_chans', 3),
-            'num_classes': state_dict.get('visual.num_classes', 1000),
-            'qkv_bias': state_dict.get('visual.qkv_bias', True),
-            'qk_scale': state_dict.get('visual.qk_scale', None),
-            'drop_rate': state_dict.get('visual.drop_rate', 0.0),
-            'attn_drop_rate': state_dict.get('visual.attn_drop_rate', 0.0),
-            'layer_scale': state_dict.get('visual.layer_scale', None),
-            'layer_scale_conv': state_dict.get('visual.layer_scale_conv', None),
-        }
-
-    # Build the model
-    model = build_model(state_dict, vision_type=inferred_vision_type, mamba_params=mamba_params).to(device)
-    if str(device) == "cpu":
-        model.float()
-    return model, _transform(model.visual.input_resolution)
-
-    # patch the device names
-    device_holder = torch.jit.trace(lambda: torch.ones([]).to(torch.device(device)), example_inputs=[])
-    device_node = [n for n in device_holder.graph.findAllNodes("prim::Constant") if "Device" in repr(n)][-1]
-
-    def _node_get(node: torch._C.Node, key: str):
-        """Gets attributes of a node which is polymorphic over return type.
+    # Load MambaVision's state_dict if using 'mambavision'
+    mamba_state_dict = None
+    if vision_type == 'mambavision':
+        if name not in _MODELS:
+            raise ValueError(f"MambaVision model '{name}' is not available. Choose from: {available_models()}")
         
-        From https://github.com/pytorch/pytorch/pull/82628
-        """
-        sel = node.kindOf(key)
-        return getattr(node, sel)(key)
+        mamba_model_info = _MODELS[name]
+        mamba_model_path = _download(mamba_model_info, download_root or os.path.expanduser("~/.cache/clip"))
+        
+        print(f"Loading MambaVision model '{name}'...")
+        mamba_model = torch.load(mamba_model_path, map_location="cpu")
+        if 'state_dict' in mamba_model:
+            mamba_state_dict = mamba_model['state_dict']
+        else:
+            mamba_state_dict = mamba_model
 
-    def patch_device(module):
-        try:
-            graphs = [module.graph] if hasattr(module, "graph") else []
-        except RuntimeError:
-            graphs = []
-
-        if hasattr(module, "forward1"):
-            graphs.append(module.forward1.graph)
-
-        for graph in graphs:
-            for node in graph.findAllNodes("prim::Constant"):
-                if "value" in node.attributeNames() and str(_node_get(node, "value")).startswith("cuda"):
-                    node.copyAttributes(device_node)
-
-    model.apply(patch_device)
-    patch_device(model.encode_image)
-    patch_device(model.encode_text)
-
-    # patch dtype to float32 on CPU
-    if str(device) == "cpu":
-        float_holder = torch.jit.trace(lambda: torch.ones([]).float(), example_inputs=[])
-        float_input = list(float_holder.graph.findNode("aten::to").inputs())[1]
-        float_node = float_input.node()
-
-        def patch_float(module):
-            try:
-                graphs = [module.graph] if hasattr(module, "graph") else []
-            except RuntimeError:
-                graphs = []
-
-            if hasattr(module, "forward1"):
-                graphs.append(module.forward1.graph)
-
-            for graph in graphs:
-                for node in graph.findAllNodes("aten::to"):
-                    inputs = list(node.inputs())
-                    for i in [1, 2]:  # dtype can be the second or third argument to aten::to()
-                        if _node_get(inputs[i].node(), "value") == 5:
-                            inputs[i].node().copyAttributes(float_node)
-
-        model.apply(patch_float)
-        patch_float(model.encode_image)
-        patch_float(model.encode_text)
-
-        model.float()
-
-    return model, _transform(model.input_resolution.item())
+    # Load MambaVision's state_dict into mamba_params if provided
+    # Note: This assumes that 'visual' is the key in CLIP's state_dict for the vision encoder
+    # Adjust accordingly based on your CLIP implementation
+    if vision_type == 'mambavision':
+        if mamba_state_dict is None:
+            raise ValueError("Failed to load MambaVision's state_dict.")
+    
+    # Initialize CLIP model with MambaVision as vision encoder
+    model = build_model(
+        clip_state_dict=clip_state_dict,
+        vision_type=vision_type,
+        mamba_state_dict=mamba_state_dict,
+        mamba_params=mamba_params
+    ).to(device)
+    
+    # If not using JIT, ensure model is in eval mode
+    if not jit:
+        model.eval()
+    
+    # Create preprocessing transform
+    # Assuming that model.visual.input_resolution is an attribute that holds the input resolution
+    # If not, adjust accordingly based on your MambaVision implementation
+    if hasattr(model.visual, 'input_resolution'):
+        input_resolution = model.visual.input_resolution
+    elif hasattr(model.visual, 'patch_embed') and hasattr(model.visual.patch_embed, 'input_resolution'):
+        input_resolution = model.visual.patch_embed.input_resolution
+    else:
+        # Fallback to default or raise an error
+        input_resolution = 224
+        warnings.warn("Input resolution not found in model.visual; using default 224.")
+    
+    preprocess = _transform(input_resolution)
+    
+    return model, preprocess
 
 
 def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: bool = False) -> Union[torch.IntTensor, torch.LongTensor]:
@@ -359,7 +313,7 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
                 tokens = tokens[:context_length]
                 tokens[-1] = eot_token
             else:
-                raise RuntimeError(f"Input {texts[i]} is too long for context length {context_length}")
+                raise RuntimeError(f"Input '{texts[i]}' is too long for context length {context_length}")
         result[i, :len(tokens)] = torch.tensor(tokens)
 
     return result

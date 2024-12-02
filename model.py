@@ -407,7 +407,7 @@ def convert_weights(model: nn.Module):
 
 # In model.py
 
-def build_model(state_dict: dict, vision_type: str, mamba_params: dict ):
+def build_model(clip_state_dict: dict, vision_type: str, mamba_state_dict: dict = None, mamba_params: dict = None):
     """
     Builds the CLIP model based on the state_dict, vision_type, and mamba_params.
 
@@ -420,22 +420,22 @@ def build_model(state_dict: dict, vision_type: str, mamba_params: dict ):
         model (CLIP): The instantiated CLIP model.
     """
     # Extract common CLIP parameters
-    embed_dim = state_dict["text_projection"].shape[1]
-    context_length = state_dict["positional_embedding"].shape[0]
-    vocab_size = state_dict["token_embedding.weight"].shape[0]
-    transformer_width = state_dict["ln_final.weight"].shape[0]
+    embed_dim = clip_state_dict["text_projection"].shape[1]
+    context_length = clip_state_dict["positional_embedding"].shape[0]
+    vocab_size = clip_state_dict["token_embedding.weight"].shape[0]
+    transformer_width = clip_state_dict["ln_final.weight"].shape[0]
     transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
+    transformer_layers = len(set(k.split(".")[2] for k in clip_state_dict if k.startswith("transformer.resblocks")))
 
     # Initialize vision encoder based on vision_type
     if vision_type == 'resnet':
         # Extract ResNet-specific parameters
-        vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
+        vision_width = clip_state_dict["visual.layer1.0.conv1.weight"].shape[0]
         vision_layers = tuple(
-            len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}")))
+            len(set(k.split(".")[2] for k in clip_state_dict if k.startswith(f"visual.layer{b}")))
             for b in [1, 2, 3, 4]
         )
-        image_resolution = state_dict.get("input_resolution", 224)
+        image_resolution = clip_state_dict.get("input_resolution", 224)
 
         visual_encoder = ModifiedResNet(
             layers=vision_layers,
@@ -446,12 +446,12 @@ def build_model(state_dict: dict, vision_type: str, mamba_params: dict ):
         )
     elif vision_type == 'vit':
         # Extract ViT-specific parameters
-        vit = "visual.proj" in state_dict
+        vit = "visual.proj" in clip_state_dict
         if vit:
-            vision_width = state_dict["visual.conv1.weight"].shape[0]
-            vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
-            vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
-            grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
+            vision_width = clip_state_dict["visual.conv1.weight"].shape[0]
+            vision_layers = len([k for k in clip_state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+            vision_patch_size = clip_state_dict["visual.conv1.weight"].shape[-1]
+            grid_size = round((clip_state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
             image_resolution = vision_patch_size * grid_size
 
             visual_encoder = VisionTransformer(
@@ -465,11 +465,10 @@ def build_model(state_dict: dict, vision_type: str, mamba_params: dict ):
         else:
             raise ValueError("State dict does not contain 'visual.proj' key for ViT.")
     elif vision_type == 'mambavision':
-        # Ensure mamba_params is provided
         if mamba_params is None:
             raise ValueError("mamba_params must be provided for 'mambavision' vision_type.")
-        
-        # Initialize MambaVision with provided parameters
+        # Ensure num_classes=0 for embedding output
+        mamba_params['num_classes'] = 0
         visual_encoder = MambaVision(**mamba_params)
     else:
         raise ValueError(f"Unsupported vision_type '{vision_type}'. Choose from 'resnet', 'vit', 'mambavision'.")
@@ -477,11 +476,11 @@ def build_model(state_dict: dict, vision_type: str, mamba_params: dict ):
     # Instantiate CLIP model with the selected visual encoder
     model = CLIP(
         embed_dim=embed_dim,
-        image_resolution=image_resolution,
+        image_resolution=224,  # Adjust if different
         vision_type=vision_type,
-        vision_layers=vision_layers if vision_type != 'mambavision' else None,
-        vision_width=vision_width if vision_type != 'mambavision' else None,
-        vision_patch_size=vision_patch_size if vision_type == 'vit' else None,
+        vision_layers=None if vision_type == 'mambavision' else vision_layers,
+        vision_width=None if vision_type == 'mambavision' else vision_width,
+        vision_patch_size=None if vision_type == 'vit' else vision_patch_size,
         mamba_params=mamba_params if vision_type == 'mambavision' else None,
         context_length=context_length,
         vocab_size=vocab_size,
@@ -492,8 +491,14 @@ def build_model(state_dict: dict, vision_type: str, mamba_params: dict ):
 
     # Convert weights (e.g., to fp16 if needed)
     convert_weights(model)
-
-    # Load state_dict into the model
-    model.load_state_dict(state_dict, strict=False)
+    
+    # Load CLIP's state_dict
+    model.load_state_dict(clip_state_dict, strict=False)
+    
+    # If using MambaVision, load its state_dict into the vision encoder
+    if vision_type == 'mambavision' and mamba_state_dict is not None:
+        model.visual.load_state_dict(mamba_state_dict, strict=True)
+        print("Loaded MambaVision's pre-trained weights into the vision encoder.")
+    
 
     return model.eval()
