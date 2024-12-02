@@ -165,36 +165,42 @@ def available_models() -> List[str]:
     return list(_MODELS.keys())
 
 
-def load(name: str, vision_type: str, mamba_params: dict, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None):
-    """Load a CLIP model
+def load(name: str, 
+         vision_type: str = 'resnet', 
+         mamba_params: dict = None,
+         device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", 
+         jit: bool = False, 
+         download_root: str = None):
+    """
+    Load a CLIP model with the specified vision encoder.
 
     Parameters
     ----------
     name : str
-        A model name listed by `clip.available_models()`, or the path to a model checkpoint containing the state_dict
-    
+        A model name listed by `clip.available_models()`, or the path to a model checkpoint containing the state_dict.
+
     vision_type : str
         The type of vision encoder to use ('resnet', 'vit', 'mambavision').
-    
+
     mamba_params : dict
         Parameters specific to MambaVision if `vision_type` is 'mambavision'.
-    
+
     device : Union[str, torch.device]
-        The device to put the loaded model
+        The device to put the loaded model.
 
     jit : bool
         Whether to load the optimized JIT model or more hackable non-JIT model (default).
 
     download_root: str
-        path to download the model files; by default, it uses "~/.cache/clip"
+        Path to download the model files; by default, it uses "~/.cache/clip".
 
     Returns
     -------
     model : torch.nn.Module
-        The CLIP model
+        The CLIP model.
 
     preprocess : Callable[[PIL.Image], torch.Tensor]
-        A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input
+        A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input.
     """
     if name in _MODELS:
         model_info = _MODELS[name]
@@ -204,56 +210,56 @@ def load(name: str, vision_type: str, mamba_params: dict, device: Union[str, tor
     else:
         raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
 
-    with open(model_path, 'rb') as opened_file:
+    if jit:
+        # Attempt to load as JIT model
         try:
-            # loading JIT archive
-            model = torch.jit.load(opened_file, map_location=device if jit else "cpu").eval()
-            state_dict = None
-        except RuntimeError:
-            # loading saved state dict
-            if jit:
-                warnings.warn(f"File {model_path} is not a JIT archive. Loading as a state dict instead")
-                jit = False
-            state_dict = torch.load(opened_file, map_location="cpu")
+            model = torch.jit.load(model_path, map_location=device).eval()
+            return model, _transform(model.visual.input_resolution)
+        except RuntimeError as e:
+            raise RuntimeError(f"Failed to load JIT model: {e}")
 
-    if not jit:
-        # Determine vision_type based on model name if not explicitly provided
-        inferred_vision_type = vision_type
-        if 'mambavision' in name.lower():
-            inferred_vision_type = 'mambavision'
-        elif 'vit' in name.lower():
-            inferred_vision_type = 'vit'
-        else:
-            inferred_vision_type = 'resnet'
+    # Load as state_dict
+    try:
+        state_dict = torch.load(model_path, map_location="cpu")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load state_dict: {e}")
 
-        # If vision_type is 'mambavision' and mamba_params not provided, extract from state_dict
-        if inferred_vision_type == 'mambavision' and mamba_params is None:
-            # Extract MambaVision parameters from state_dict or define defaults
-            # Adjust the keys based on your state_dict structure
-            mamba_params = {
-                'dim': state_dict.get('visual.dim', 128),
-                'in_dim': state_dict.get('visual.in_dim', 64),
-                'depths': state_dict.get('visual.depths', [3, 3, 10, 5]),
-                'num_heads': state_dict.get('visual.num_heads', [2, 4, 8, 16]),
-                'window_size': state_dict.get('visual.window_size', [8, 8, 14, 7]),
-                'mlp_ratio': state_dict.get('visual.mlp_ratio', 4),
-                'drop_path_rate': state_dict.get('visual.drop_path_rate', 0.2),
-                'in_chans': state_dict.get('visual.in_chans', 3),
-                'num_classes': state_dict.get('visual.num_classes', 1000),
-                'qkv_bias': state_dict.get('visual.qkv_bias', True),
-                'qk_scale': state_dict.get('visual.qk_scale', None),
-                'drop_rate': state_dict.get('visual.drop_rate', 0.0),
-                'attn_drop_rate': state_dict.get('visual.attn_drop_rate', 0.0),
-                'layer_scale': state_dict.get('visual.layer_scale', None),
-                'layer_scale_conv': state_dict.get('visual.layer_scale_conv', None),
-            }
+    # Determine vision_type based on model name if not explicitly provided
+    inferred_vision_type = vision_type
+    if 'mambavision' in name.lower():
+        inferred_vision_type = 'mambavision'
+    elif 'vit' in name.lower():
+        inferred_vision_type = 'vit'
+    else:
+        inferred_vision_type = 'resnet'
 
-        model = build_model(state_dict or model.state_dict(), vision_type=inferred_vision_type)
+    # If vision_type is 'mambavision' and mamba_params not provided, extract from state_dict
+    if inferred_vision_type == 'mambavision' and mamba_params is None:
+        # Extract MambaVision parameters from state_dict or define defaults
+        # Adjust the keys based on your state_dict structure
+        mamba_params = {
+            'dim': state_dict.get('visual.dim', 128),
+            'in_dim': state_dict.get('visual.in_dim', 64),
+            'depths': state_dict.get('visual.depths', [3, 3, 10, 5]),
+            'num_heads': state_dict.get('visual.num_heads', [2, 4, 8, 16]),
+            'window_size': state_dict.get('visual.window_size', [8, 8, 14, 7]),
+            'mlp_ratio': state_dict.get('visual.mlp_ratio', 4),
+            'drop_path_rate': state_dict.get('visual.drop_path_rate', 0.2),
+            'in_chans': state_dict.get('visual.in_chans', 3),
+            'num_classes': state_dict.get('visual.num_classes', 1000),
+            'qkv_bias': state_dict.get('visual.qkv_bias', True),
+            'qk_scale': state_dict.get('visual.qk_scale', None),
+            'drop_rate': state_dict.get('visual.drop_rate', 0.0),
+            'attn_drop_rate': state_dict.get('visual.attn_drop_rate', 0.0),
+            'layer_scale': state_dict.get('visual.layer_scale', None),
+            'layer_scale_conv': state_dict.get('visual.layer_scale_conv', None),
+        }
 
-        model = model.to(device)
-        if str(device) == "cpu":
-            model.float()
-        return model, _transform(model.visual.input_resolution)
+    # Build the model
+    model = build_model(state_dict, vision_type=inferred_vision_type, mamba_params=mamba_params).to(device)
+    if str(device) == "cpu":
+        model.float()
+    return model, _transform(model.visual.input_resolution)
 
     # patch the device names
     device_holder = torch.jit.trace(lambda: torch.ones([]).to(torch.device(device)), example_inputs=[])
