@@ -1,13 +1,13 @@
 from collections import OrderedDict
-import math
 from typing import Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from mamba_vision import MambaVision, mamba_vision_T, mamba_vision_S, mamba_vision_B, mamba_vision_L, mamba_vision_L2
-from .registry import register_pip_model  # Relative import
+from mamba_vision import MambaVision
+
+
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -246,11 +246,12 @@ class CLIP(nn.Module):
     def __init__(self,
                  embed_dim: int,
                  # vision
-                 image_encoder_type: str,
                  image_resolution: int,
+                 vision_type: str,
                  vision_layers: Union[Tuple[int, int, int, int], int],
                  vision_width: int,
                  vision_patch_size: int,
+                 mamba_params: dict,
                  # text
                  context_length: int,
                  vocab_size: int,
@@ -259,49 +260,40 @@ class CLIP(nn.Module):
                  transformer_layers: int
                  ):
         super().__init__()
-
+        
         self.context_length = context_length
 
-         # Initialize Image Encoder based on the selected type
-        if image_encoder_type == 'Original':
-            # Initialize the original CLIP image encoder (e.g., ResNet or VisionTransformer)
-            # Here, assuming it's a ResNet-based encoder; adjust as per your original CLIP implementation
-            self.visual = ModifiedResNet(
-                layers=vision_layers,
-                output_dim=embed_dim,
-                width=vision_width,
-                input_resolution=image_resolution,
-                patch_size=vision_patch_size
-            )
-        elif image_encoder_type.startswith('MambaVision'):
-            # Initialize MambaVision image encoder
-            # Import MambaVision models inside the class to avoid circular imports
-            if image_encoder_type == 'MambaVision_T':
-                from .mamba_vision import mamba_vision_T
-                self.visual = mamba_vision_T(pretrained=True)
-            elif image_encoder_type == 'MambaVision_S':
-                from .mamba_vision import mamba_vision_S
-                self.visual = mamba_vision_S(pretrained=True)
-            elif image_encoder_type == 'MambaVision_B':
-                from .mamba_vision import mamba_vision_B
-                self.visual = mamba_vision_B(pretrained=True)
-            elif image_encoder_type == 'MambaVision_L':
-                from .mamba_vision import mamba_vision_L
-                self.visual = mamba_vision_L(pretrained=True)
-            elif image_encoder_type == 'MambaVision_L2':
-                from .mamba_vision import mamba_vision_L2
-                self.visual = mamba_vision_L2(pretrained=True)
+        if vision_type == 'resnet':
+            if isinstance(vision_layers, (tuple, list)) and vision_width is not None:
+                vision_heads = vision_width * 32 // 64
+                self.visual = ModifiedResNet(
+                    layers=vision_layers,
+                    output_dim=embed_dim,
+                    heads=vision_heads,
+                    input_resolution=image_resolution,
+                    width=vision_width
+                )
             else:
-                raise ValueError(f"Unsupported MambaVision variant: {image_encoder_type}")
+                raise ValueError("For 'resnet' vision_type, vision_layers should be a tuple or list and vision_width must be specified.")
+        elif vision_type == 'vit':
+            if isinstance(vision_layers, int) and vision_width is not None and vision_patch_size is not None:
+                vision_heads = vision_width // 64
+                self.visual = VisionTransformer(
+                    input_resolution=image_resolution,
+                    patch_size=vision_patch_size,
+                    width=vision_width,
+                    layers=vision_layers,
+                    heads=vision_heads,
+                    output_dim=embed_dim
+                )
+            else:
+                raise ValueError("For 'vit' vision_type, vision_layers, vision_width, and vision_patch_size must be specified.")
+        elif vision_type == 'mambavision':
+            if mamba_params is None:
+                raise ValueError("mamba_params must be provided for 'mambavision' vision_type.")
+            self.visual = MambaVision(**mamba_params)
         else:
-            raise ValueError(f"Unsupported image_encoder_type: {image_encoder_type}")
-
-        self.transformer = Transformer(
-            width=transformer_width,
-            layers=transformer_layers,
-            heads=transformer_heads,
-            attn_mask=self.build_attention_mask()
-        )
+            raise ValueError(f"Unsupported vision_type '{vision_type}'. Choose from 'resnet', 'vit', 'mambavision'.")
 
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
@@ -314,16 +306,33 @@ class CLIP(nn.Module):
         self.initialize_parameters()
 
     def initialize_parameters(self):
-        # Initialize Text Encoder parameters
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
-        nn.init.normal_(self.text_projection, std=1.0 / math.sqrt(self.transformer.width))
-        # Initialize other parameters as needed
 
-        if hasattr(self, 'image_projection'):
-            # Initialize Projection layer if MambaVision is used
-            nn.init.normal_(self.image_projection.weight, std=0.02)
-            nn.init.zeros_(self.image_projection.bias)
+        if isinstance(self.visual, ModifiedResNet):
+            if self.visual.attnpool is not None:
+                std = self.visual.attnpool.c_proj.in_features ** -0.5
+                nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.k_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.v_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.c_proj.weight, std=std)
+
+            for resnet_block in [self.visual.layer1, self.visual.layer2, self.visual.layer3, self.visual.layer4]:
+                for name, param in resnet_block.named_parameters():
+                    if name.endswith("bn3.weight"):
+                        nn.init.zeros_(param)
+
+        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
+        attn_std = self.transformer.width ** -0.5
+        fc_std = (2 * self.transformer.width) ** -0.5
+        for block in self.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
+        if self.text_projection is not None:
+            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -337,33 +346,38 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def forward(self, image, text):
-        # Define the forward pass
-        # Encode image
-        if hasattr(self, 'image_projection'):
-            features = self.visual.forward_features(image)
-            image_features = self.image_projection(features)
-        else:
-            image_features = self.visual(image)
-        
-        # Encode text
-        x = self.token_embedding(text)
-        x = x + self.positional_embedding
+    def encode_image(self, image):
+        return self.visual(image.type(self.dtype))
+
+    def encode_text(self, text):
+        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+
+        x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x)
+        x = self.ln_final(x).type(self.dtype)
+
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-        
-        # Normalize features
+
+        return x
+
+    def forward(self, image, text):
+        image_features = self.encode_image(image)
+        text_features = self.encode_text(text)
+
+        # normalized features
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
-        text_features = x / x.norm(dim=1, keepdim=True)
-        
-        # Compute cosine similarity
+        text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+        # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()
         logits_per_text = logits_per_image.t()
-        
+
+        # shape = [global_batch_size, global_batch_size]
         return logits_per_image, logits_per_text
 
 
@@ -391,24 +405,18 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict):
-    vit = "visual.proj" in state_dict
+def build_model(state_dict: dict, vision_type: str):
+    """
+    Builds the CLIP model based on the state_dict and vision_type.
 
-    if vit:
-        vision_width = state_dict["visual.conv1.weight"].shape[0]
-        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
-        vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
-        grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
-        image_resolution = vision_patch_size * grid_size
-    else:
-        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
-        vision_layers = tuple(counts)
-        vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
-        output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
-        vision_patch_size = None
-        assert output_width ** 2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
-        image_resolution = output_width * 32
+    Parameters:
+        state_dict (dict): The state dictionary of the model.
+        vision_type (str): The type of vision encoder ('resnet', 'vit', 'mambavision').
 
+    Returns:
+        model (CLIP): The instantiated CLIP model.
+    """
+    # Extract common CLIP parameters
     embed_dim = state_dict["text_projection"].shape[1]
     context_length = state_dict["positional_embedding"].shape[0]
     vocab_size = state_dict["token_embedding.weight"].shape[0]
@@ -416,59 +424,93 @@ def build_model(state_dict: dict):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
 
-    model = CLIP(
-        embed_dim,
-        image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
-    )
+    # Initialize vision encoder based on vision_type
+    if vision_type == 'resnet':
+        # Extract ResNet-specific parameters
+        # Assuming state_dict keys follow CLIP's ModifiedResNet naming
+        # Extract vision_width, vision_layers, etc.
+        vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
+        vision_layers = tuple(
+            len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}")))
+            for b in [1, 2, 3, 4]
+        )
+        image_resolution = state_dict.get("input_resolution", 224)
 
-    for key in ["input_resolution", "context_length", "vocab_size"]:
-        if key in state_dict:
-            del state_dict[key]
+        visual_encoder = ModifiedResNet(
+            layers=vision_layers,
+            output_dim=embed_dim,
+            heads=vision_width * 32 // 64,
+            input_resolution=image_resolution,
+            width=vision_width
+        )
+    elif vision_type == 'vit':
+        # Extract ViT-specific parameters
+        vit = "visual.proj" in state_dict
+        if vit:
+            vision_width = state_dict["visual.conv1.weight"].shape[0]
+            vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+            vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
+            grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
+            image_resolution = vision_patch_size * grid_size
 
-    convert_weights(model)
-    model.load_state_dict(state_dict)
-    return model.eval()
+            visual_encoder = VisionTransformer(
+                input_resolution=image_resolution,
+                patch_size=vision_patch_size,
+                width=vision_width,
+                layers=vision_layers,
+                heads=vision_width // 64,
+                output_dim=embed_dim
+            )
+        else:
+            raise ValueError("State dict does not contain 'visual.proj' key for ViT.")
+    elif vision_type == 'mambavision':
+        # Extract MambaVision-specific parameters
+        # The exact extraction depends on how MambaVision parameters are stored in state_dict
+        # Assuming they are prefixed with 'visual.' similar to other encoders
 
-# Define clip_with_encoder
-def clip_with_encoder(image_encoder_type='Original', **kwargs):
-    embed_dim = 512  # Adjust based on your requirements
+        # Example extraction:
+        mamba_params = {
+            'dim': state_dict.get('visual.dim', 128),
+            'in_dim': state_dict.get('visual.in_dim', 64),
+            'depths': state_dict.get('visual.depths', [3, 3, 10, 5]),
+            'num_heads': state_dict.get('visual.num_heads', [2, 4, 8, 16]),
+            'window_size': state_dict.get('visual.window_size', [8, 8, 14, 7]),
+            'mlp_ratio': state_dict.get('visual.mlp_ratio', 4),
+            'drop_path_rate': state_dict.get('visual.drop_path_rate', 0.2),
+            'in_chans': state_dict.get('visual.in_chans', 3),
+            'num_classes': state_dict.get('visual.num_classes', 1000),
+            'qkv_bias': state_dict.get('visual.qkv_bias', True),
+            'qk_scale': state_dict.get('visual.qk_scale', None),
+            'drop_rate': state_dict.get('visual.drop_rate', 0.0),
+            'attn_drop_rate': state_dict.get('visual.attn_drop_rate', 0.0),
+            'layer_scale': state_dict.get('visual.layer_scale', None),
+            'layer_scale_conv': state_dict.get('visual.layer_scale_conv', None),
+        }
+
+        visual_encoder = MambaVision(**mamba_params)
+    else:
+        raise ValueError(f"Unsupported vision_type '{vision_type}'.")
+
+    # Instantiate CLIP model with the selected visual encoder
     model = CLIP(
         embed_dim=embed_dim,
-        image_encoder_type=image_encoder_type,
-        **kwargs
+        image_resolution=image_resolution,
+        vision_type=vision_type,
+        vision_layers=vision_layers if vision_type != 'mambavision' else None,
+        vision_width=vision_width if vision_type != 'mambavision' else None,
+        vision_patch_size=vision_patch_size if vision_type == 'vit' else None,
+        mamba_params=mamba_params if vision_type == 'mambavision' else None,
+        context_length=context_length,
+        vocab_size=vocab_size,
+        transformer_width=transformer_width,
+        transformer_heads=transformer_heads,
+        transformer_layers=transformer_layers
     )
-    return model
 
-# Register models with the registry
-def register_models():
-    # Define a factory function for CLIP with Original Image Encoder
-    def create_clip_original(pretrained=False, **kwargs):
-        return clip_with_encoder(image_encoder_type='Original', **kwargs)
-    
-    # Define factory functions for CLIP with MambaVision Image Encoder variants
-    def create_clip_mamba_T(pretrained=False, **kwargs):
-        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
-    
-    def create_clip_mamba_S(pretrained=False, **kwargs):
-        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
-    
-    def create_clip_mamba_B(pretrained=False, **kwargs):
-        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
-    
-    def create_clip_mamba_L(pretrained=False, **kwargs):
-        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
-    
-    def create_clip_mamba_L2(pretrained=False, **kwargs):
-        return clip_with_encoder(image_encoder_type='MambaVision', **kwargs)
-    
-    # Register the models
-    register_pip_model('CLIP_Original', create_clip_original)
-    register_pip_model('CLIP_MambaVision_T', create_clip_mamba_T)
-    register_pip_model('CLIP_MambaVision_S', create_clip_mamba_S)
-    register_pip_model('CLIP_MambaVision_B', create_clip_mamba_B)
-    register_pip_model('CLIP_MambaVision_L', create_clip_mamba_L)
-    register_pip_model('CLIP_MambaVision_L2', create_clip_mamba_L2)
+    # Convert weights (e.g., to fp16 if needed)
+    convert_weights(model)
 
-# Call the registration function
-register_models()
+    # Load state_dict into the model
+    model.load_state_dict(state_dict, strict=False)
+
+    return model.eval()

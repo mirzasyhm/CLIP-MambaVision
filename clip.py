@@ -10,10 +10,8 @@ from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from tqdm import tqdm
 
-from model import build_model
+from .model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
-from .registry import model_entrypoint
-
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -39,6 +37,12 @@ _MODELS = {
     "ViT-B/16": "https://openaipublic.azureedge.net/clip/models/5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f/ViT-B-16.pt",
     "ViT-L/14": "https://openaipublic.azureedge.net/clip/models/b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836/ViT-L-14.pt",
     "ViT-L/14@336px": "https://openaipublic.azureedge.net/clip/models/3035c92b350959924f9f00213499208652fc7ea050643e8b385c2dac08641f02/ViT-L-14-336px.pt",
+    "MambaVision-T": "https://huggingface.co/nvidia/MambaVision-T-1K/resolve/main/mambavision_tiny_1k.pth.tar",
+    "MambaVision-T2": "https://huggingface.co/nvidia/MambaVision-T2-1K/resolve/main/mambavision_tiny2_1k.pth.tar",
+    "MambaVision-S": "https://huggingface.co/nvidia/MambaVision-S-1K/resolve/main/mambavision_small_1k.pth.tar",
+    "MambaVision-B": "https://huggingface.co/nvidia/MambaVision-B-1K/resolve/main/mambavision_base_1k.pth.tar",
+    "MambaVision-L": "https://huggingface.co/nvidia/MambaVision-L-1K/resolve/main/mambavision_large_1k.pth.tar",
+    "MambaVision-L2": "https://huggingface.co/nvidia/MambaVision-L2-1K/resolve/main/mambavision_large2_1k.pth.tar",
 }
 
 
@@ -89,25 +93,24 @@ def _transform(n_px):
 
 
 def available_models() -> List[str]:
-    """Returns the names of available CLIP models, including those with MambaVision."""
-    return list(_MODELS.keys()) + [
-        'CLIP_Original',
-        'CLIP_MambaVision_T',
-        'CLIP_MambaVision_S',
-        'CLIP_MambaVision_B',
-        'CLIP_MambaVision_L',
-        'CLIP_MambaVision_L2'
-    ]
+    """Returns the names of available CLIP models"""
+    return list(_MODELS.keys())
 
 
-def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None,  **kwargs):
+def load(name: str, vision_type: str, mamba_params: dict, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None):
     """Load a CLIP model
 
     Parameters
     ----------
     name : str
         A model name listed by `clip.available_models()`, or the path to a model checkpoint containing the state_dict
-
+    
+    vision_type : str
+        The type of vision encoder to use ('resnet', 'vit', 'mambavision').
+    
+    mamba_params : dict
+        Parameters specific to MambaVision if `vision_type` is 'mambavision'.
+    
     device : Union[str, torch.device]
         The device to put the loaded model
 
@@ -125,31 +128,6 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     preprocess : Callable[[PIL.Image], torch.Tensor]
         A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input
     """
-    
-    if name in [
-        'CLIP_Original',
-        'CLIP_MambaVision_T',
-        'CLIP_MambaVision_S',
-        'CLIP_MambaVision_B',
-        'CLIP_MambaVision_L',
-        'CLIP_MambaVision_L2'
-    ]:
-        # Instantiate the model using the registry
-        model = model_entrypoint(name)(pretrained=False, **kwargs)
-        model.to(device)
-        model.eval()
-        
-        # Define preprocessing (assuming input resolution is 224)
-        preprocess = Compose([
-            Resize(224, interpolation=Image.BICUBIC),
-            CenterCrop(224),
-            lambda image: image.convert("RGB"),
-            ToTensor(),
-            Normalize((0.48145466, 0.4578275, 0.40821073), 
-                      (0.26862954, 0.26130258, 0.27577711))
-        ])
-        return model, preprocess
-    
     if name in _MODELS:
         model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
     elif os.path.isfile(name):
@@ -170,7 +148,40 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
             state_dict = torch.load(opened_file, map_location="cpu")
 
     if not jit:
-        model = build_model(state_dict or model.state_dict()).to(device)
+        # Determine vision_type based on model name if not explicitly provided
+        inferred_vision_type = vision_type
+        if 'mambavision' in name.lower():
+            inferred_vision_type = 'mambavision'
+        elif 'vit' in name.lower():
+            inferred_vision_type = 'vit'
+        else:
+            inferred_vision_type = 'resnet'
+
+        # If vision_type is 'mambavision' and mamba_params not provided, extract from state_dict
+        if inferred_vision_type == 'mambavision' and mamba_params is None:
+            # Extract MambaVision parameters from state_dict or define defaults
+            # Adjust the keys based on your state_dict structure
+            mamba_params = {
+                'dim': state_dict.get('visual.dim', 128),
+                'in_dim': state_dict.get('visual.in_dim', 64),
+                'depths': state_dict.get('visual.depths', [3, 3, 10, 5]),
+                'num_heads': state_dict.get('visual.num_heads', [2, 4, 8, 16]),
+                'window_size': state_dict.get('visual.window_size', [8, 8, 14, 7]),
+                'mlp_ratio': state_dict.get('visual.mlp_ratio', 4),
+                'drop_path_rate': state_dict.get('visual.drop_path_rate', 0.2),
+                'in_chans': state_dict.get('visual.in_chans', 3),
+                'num_classes': state_dict.get('visual.num_classes', 1000),
+                'qkv_bias': state_dict.get('visual.qkv_bias', True),
+                'qk_scale': state_dict.get('visual.qk_scale', None),
+                'drop_rate': state_dict.get('visual.drop_rate', 0.0),
+                'attn_drop_rate': state_dict.get('visual.attn_drop_rate', 0.0),
+                'layer_scale': state_dict.get('visual.layer_scale', None),
+                'layer_scale_conv': state_dict.get('visual.layer_scale_conv', None),
+            }
+
+        model = build_model(state_dict or model.state_dict(), vision_type=inferred_vision_type)
+
+        model = model.to(device)
         if str(device) == "cpu":
             model.float()
         return model, _transform(model.visual.input_resolution)
